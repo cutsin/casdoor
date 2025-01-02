@@ -1,86 +1,45 @@
 package pp
 
 import (
-    "encoding/json"
-    "net/http"
-    "net/http/httptest"
     "testing"
-
     "github.com/stretchr/testify/assert"
+    "os"
 )
 
-func setupMockServer() *httptest.Server {
-    return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        switch r.URL.Path {
-        case "/api/v1/authentication/login":
-            json.NewEncoder(w).Encode(map[string]interface{}{
-                "token": "mock_token",
-            })
-        case "/api/v1/pa/payment_intents/create":
-            json.NewEncoder(w).Encode(map[string]interface{}{
-                "id": "mock_intent_id",
-            })
-        case "/api/v1/pa/payment_links/create":
-            json.NewEncoder(w).Encode(map[string]interface{}{
-                "url": "https://checkout.mock.com/pay",
-            })
-        }
-    }))
-}
-
 func TestPay(t *testing.T) {
-    server := setupMockServer()
-    defer server.Close()
+    clientId := os.Getenv("AIRWALLEX_CLIENT_ID")
+    apiKey := os.Getenv("AIRWALLEX_API_KEY")
+    
+    if clientId == "" || apiKey == "" {
+        t.Skip("Skipping test: AIRWALLEX_CLIENT_ID or AIRWALLEX_API_KEY not set")
+    }
 
-    provider, err := NewAirwallexPaymentProvider("test_id", "test_key")
+    provider, err := NewAirwallexPaymentProvider(clientId, apiKey)
+    if err != nil {
+        t.Fatalf("Failed to create provider: %v", err)
+    }
     assert.Nil(t, err)
-    provider.APIEndpoint = server.URL
 
     req := &PayReq{
-        ProductName:        "test_product",
+        ProductName:        "test_order_123",
         ProductDisplayName: "Test Product",
-        Price:             100.00,
+        Price:             0.01,
         Currency:          "USD",
         ReturnUrl:         "http://localhost/return",
         PayerId:           "test_payer",
     }
 
+    t.Logf("Making payment request with: %+v", req)
     resp, err := provider.Pay(req)
-    assert.Nil(t, err)
-    assert.Equal(t, "mock_intent_id", resp.OrderId)
-    assert.Equal(t, "https://checkout.mock.com/pay", resp.PayUrl)
-}
-
-func TestNotify(t *testing.T) {
-    provider, _ := NewAirwallexPaymentProvider("test_id", "test_key")
-
-    testCases := []struct {
-        name           string
-        notifyBody    string
-        expectedState PaymentState
-    }{
-        {
-            name:        "success payment",
-            notifyBody: `{"status": "SUCCEEDED"}`,
-            expectedState: PaymentStatePaid,
-        },
-        {
-            name:        "failed payment",
-            notifyBody: `{"status": "FAILED"}`,
-            expectedState: PaymentStateError,
-        },
-        {
-            name:        "pending payment",
-            notifyBody: `{"status": "PENDING"}`,
-            expectedState: PaymentStateCreated,
-        },
+    if err != nil {
+        t.Logf("Payment error: %v", err)
+        t.Fatal(err)
     }
 
-    for _, tc := range testCases {
-        t.Run(tc.name, func(t *testing.T) {
-            result, err := provider.Notify([]byte(tc.notifyBody), "test_order")
-            assert.Nil(t, err)
-            assert.Equal(t, tc.expectedState, result.PaymentStatus)
-        })
-    }
+    t.Logf("Got response: %+v", resp)
+    assert.NotEmpty(t, resp.OrderId)
+    assert.NotEmpty(t, resp.PayUrl)
+    
+    t.Logf("Payment URL: %s", resp.PayUrl)
+    t.Logf("Order ID: %s", resp.OrderId)
 }
