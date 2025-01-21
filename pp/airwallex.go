@@ -4,34 +4,49 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-
-	// "io/ioutil"
 	"net/http"
-	// "time"
-	// "github.com/casdoor/casdoor/conf"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/casdoor/casdoor/util"
+	// "github.com/casdoor/casdoor/util"
+	// "io/ioutil"
+	// "github.com/casdoor/casdoor/conf"
 )
 
 type AirwallexPaymentProvider struct {
 	ClientId    string
 	APIKey      string
 	APIEndpoint string
+	client      *http.Client
+	tokenCache  *tokenInfo
+	tokenMutex  sync.RWMutex
 }
 
-func NewAirwallexPaymentProvider(clientId, apiKey string) (*AirwallexPaymentProvider, error) {
-	endpoint := "https://api.airwallex.com"
+type tokenInfo struct {
+	Token           string `json:"token"`
+	ExpiresAt       string `json:"expires_at"`
+	parsedExpiresAt time.Time
+}
 
-	return &AirwallexPaymentProvider{
+func NewAirwallexPaymentProvider(clientId string, apiKey string) (*AirwallexPaymentProvider, error) {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	pp := &AirwallexPaymentProvider{
 		ClientId:    clientId,
 		APIKey:      apiKey,
-		APIEndpoint: endpoint,
-	}, nil
+		APIEndpoint: "https://api.airwallex.com",
+		client:      client,
+	}
+	return pp, nil
 }
 
 func (pp *AirwallexPaymentProvider) Pay(req *PayReq) (*PayResp, error) {
 	token, err := pp.getAccessToken()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get access token: %w", err)
+		return nil, fmt.Errorf("failed to get access token: %v", err)
 	}
 
 	// Create payment intent
@@ -40,41 +55,42 @@ func (pp *AirwallexPaymentProvider) Pay(req *PayReq) (*PayResp, error) {
 		"amount":            req.Price,
 		"currency":          req.Currency,
 		"merchant_order_id": req.ProductName,
+		"descriptor":        joinAttachString([]string{req.ProductDisplayName, req.ProductName, req.ProviderName}),
 	}
 
 	intentUrl := fmt.Sprintf("%s/api/v1/pa/payment_intents/create", pp.APIEndpoint)
 	intentResp, err := pp.doRequest("POST", intentUrl, token, intentReq)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create payment intent: %v", err)
 	}
-	fmt.Println(intentResp)
 
 	// Create payment link
 	linkReq := map[string]interface{}{
 		"payment_intent_id": intentResp["id"],
 		"return_url":        req.ReturnUrl,
+		"title":             req.ProductDisplayName,
+		"reusable":          false,
 	}
 
 	linkUrl := fmt.Sprintf("%s/api/v1/pa/payment_links/create", pp.APIEndpoint)
 	linkResp, err := pp.doRequest("POST", linkUrl, token, linkReq)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create payment link: %v", err)
 	}
 
-	// Add validation for required fields
-	payUrl, ok := linkResp["url"]
-	if !ok || payUrl == nil {
-		return nil, fmt.Errorf("payment URL is missing from response: %v", linkResp)
+	payUrl, ok := linkResp["url"].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid payment URL in response: %v", linkResp)
 	}
 
-	orderId, ok := intentResp["id"]
-	if !ok || orderId == nil {
-		return nil, fmt.Errorf("order ID is missing from response: %v", intentResp)
+	orderId, ok := intentResp["id"].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid order ID in response: %v", intentResp)
 	}
 
 	return &PayResp{
-		PayUrl:  payUrl.(string),
-		OrderId: orderId.(string),
+		PayUrl:  payUrl,
+		OrderId: orderId,
 	}, nil
 }
 
@@ -84,21 +100,42 @@ func (pp *AirwallexPaymentProvider) Notify(body []byte, orderId string) (*Notify
 		return nil, err
 	}
 
-	status := PaymentStateError // default to error state
-	switch notification["status"].(string) {
+	statusStr, ok := notification["status"].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid status in notification")
+	}
+
+	paymentStatus := PaymentStateError
+	switch statusStr {
 	case "SUCCEEDED":
-		status = PaymentStatePaid
+		paymentStatus = PaymentStatePaid
 	case "FAILED", "CANCELLED":
-		status = PaymentStateError
+		paymentStatus = PaymentStateError
+	case "EXPIRED":
+		paymentStatus = PaymentStateTimeout
 	case "PENDING", "REQUIRES_PAYMENT_METHOD", "REQUIRES_CUSTOMER_ACTION":
-		status = PaymentStateCreated
+		paymentStatus = PaymentStateCreated
+	}
+
+	amount, _ := notification["amount"].(float64)
+	currency, _ := notification["currency"].(string)
+	descriptor, _ := notification["descriptor"].(string)
+
+	var productDisplayName, productName, providerName string
+	if descriptor != "" {
+		productDisplayName, productName, providerName, _ = parseAttachString(descriptor)
 	}
 
 	return &NotifyResult{
-		PaymentName:   "Airwallex",
-		PaymentStatus: status,
-		NotifyMessage: string(body),
-		OrderId:       orderId,
+		PaymentName:        "Airwallex",
+		PaymentStatus:      paymentStatus,
+		NotifyMessage:      string(body),
+		OrderId:            orderId,
+		Price:              amount,
+		Currency:           currency,
+		ProductName:        productName,
+		ProductDisplayName: productDisplayName,
+		ProviderName:       providerName,
 	}, nil
 }
 
@@ -107,95 +144,83 @@ func (pp *AirwallexPaymentProvider) GetInvoice(paymentName, personName, personId
 }
 
 func (pp *AirwallexPaymentProvider) GetResponseError(err error) string {
-	return err.Error()
+	if err == nil {
+		return "success"
+	}
+	return "fail"
 }
 
 func (pp *AirwallexPaymentProvider) getAccessToken() (string, error) {
-	url := fmt.Sprintf("%s/api/v1/authentication/login", pp.APIEndpoint)
+	pp.tokenMutex.Lock()
+	defer pp.tokenMutex.Unlock()
 
-	// Create empty JSON body
-	emptyBody := bytes.NewBuffer([]byte("{}"))
-	req, err := http.NewRequest("POST", url, emptyBody)
+	if pp.tokenCache != nil && time.Now().Before(pp.tokenCache.parsedExpiresAt) {
+		return pp.tokenCache.Token, nil
+	}
+
+	url := fmt.Sprintf("%s/api/v1/authentication/login", pp.APIEndpoint)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte("{}")))
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return "", err
 	}
 
 	req.Header.Set("x-client-id", pp.ClientId)
 	req.Header.Set("x-api-key", pp.APIKey)
-	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := pp.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to send request: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	var result map[string]interface{}
+	var result tokenInfo
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
+		return "", err
 	}
 
-	token, ok := result["token"]
-	if !ok || token == nil {
-		return "", fmt.Errorf("token not found in response: %v", result)
+	if result.Token == "" || result.ExpiresAt == "" {
+		return "", fmt.Errorf("invalid response: missing token or expires_at")
 	}
 
-	tokenStr, ok := token.(string)
-	if !ok {
-		return "", fmt.Errorf("token is not a string: %v", token)
+	expiresAt, err := time.Parse(time.RFC3339, strings.Replace(result.ExpiresAt, "+0000", "+00:00", 1))
+	if err != nil {
+		return "", fmt.Errorf("failed to parse expires_at: %v", err)
 	}
 
-	return tokenStr, nil
+	result.parsedExpiresAt = expiresAt
+	pp.tokenCache = &result
+
+	return result.Token, nil
 }
 
 func (pp *AirwallexPaymentProvider) doRequest(method, url, token string, body interface{}) (map[string]interface{}, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request body: %w", err)
-	}
-
-	// Generate request ID
-	requestId := util.GenerateId()
-
-	// Add request_id to the request body
-	var requestBody map[string]interface{}
-	if err := json.Unmarshal(jsonBody, &requestBody); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request body: %w", err)
-	}
-	requestBody["request_id"] = requestId
-
-	// Re-marshal the body with request_id
-	jsonBody, err = json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request body with request_id: %w", err)
+		return nil, fmt.Errorf("failed to marshal request body: %v", err)
 	}
 
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	fmt.Println("_____________", req)
-	fmt.Println(client)
-	resp, err := client.Do(req)
-	fmt.Println(resp)
+	resp, err := pp.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
+		return nil, fmt.Errorf("request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("failed to decode response: %v", err)
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("request failed with status %d: %v", resp.StatusCode, result)
+		errorMsg, _ := json.Marshal(result)
+		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(errorMsg))
 	}
 
 	return result, nil
