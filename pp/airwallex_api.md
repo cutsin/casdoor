@@ -1,5 +1,9 @@
 # AirWallex APIs
 
+# Sandbox
+
+测试卡：https://www.airwallex.com/docs/payments__test-card-numbers
+
 ## API权限
 
 1. **获取访问令牌** [Obtain access token](https://www.airwallex.com/docs/api?v=2024-08-07#/Authentication/API_Access/)
@@ -115,8 +119,15 @@ GET /api/v1/pa/payment_intents[id]
 GET /api/v1/pa/payment_intents/[id]
 ```
 
+## 收单链接（@airwallex/components-sdk）
 
-## 支付链接
+代码中有个redirectToCheckout，生成如下链接：
+[https://checkout.airwallex.com/#/standalone/checkout?intent_id=[intent_id]&client_secret=[client_secret]&currency=[currency]&country_code=JPY&from=http://localhost:3000&sessionId=4a8a225e-94d5-45b7-9370-c8f81d5da7d1]()
+
+`sessionId` 约等于`OrderId`，casdoor里是`r.PaymentName`
+
+
+## 收款链接
 
 1. **创建支付链接** [Create a PaymentLink](https://www.airwallex.com/docs/api?v=2024-08-07#/Payment_Acceptance/Payment_Links/_api_v1_pa_payment_links_create/post)
 允许您使用付款链接 URL 接受购物者的付款。付款链接 URL 将您的购物者带到 Airwallex 托管的安全结账页面，他们可以在此使用自己喜欢的付款方式付款。
@@ -134,3 +145,4 @@ JSON Body:
   "reusable": false
 }
 ```
+

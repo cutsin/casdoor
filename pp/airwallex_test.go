@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/casdoor/casdoor/util"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -99,6 +100,24 @@ func TestGetAccessToken(t *testing.T) {
 	}
 }
 
+func TestGetAccessTokenSimple(t *testing.T) {
+	clientId := os.Getenv("AIRWALLEX_CLIENT_ID")
+	apiKey := os.Getenv("AIRWALLEX_API_KEY")
+
+	if clientId == "" || apiKey == "" {
+		t.Skip("Skipping test: AIRWALLEX_CLIENT_ID or AIRWALLEX_API_KEY not set")
+	}
+
+	pp, _ := NewAirwallexPaymentProvider(clientId, apiKey)
+	token, err := pp.getAccessToken()
+
+	fmt.Printf("Token result: %v\n", token)
+	fmt.Printf("Error: %v\n", err)
+
+	assert.NotEmpty(t, token)
+	assert.Nil(t, err)
+}
+
 func TestPay(t *testing.T) {
 	provider := setupTestProvider(t)
 	if provider == nil {
@@ -106,11 +125,14 @@ func TestPay(t *testing.T) {
 	}
 
 	req := &PayReq{
-		ProductName:        "test123",
-		ProductDisplayName: "Test",
+		PaymentName:        util.GenerateId(),
+		ProductName:        "monthly_memeber",
+		ProductDisplayName: "月会员",
+		ProductDescription: "月額会員 カスタムデジタルアバターなし",
+		ProductImage:       "https://app-jp.psyai.com/images/promote/membership-demo.png",
 		Price:              0.01,
 		Currency:           "USD",
-		ReturnUrl:          "http://localhost/return",
+		ReturnUrl:          "https://app-jp.psyai.com/",
 		ProviderName:       "awx",
 	}
 
