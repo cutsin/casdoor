@@ -19,14 +19,8 @@ type AirwallexPaymentProvider struct {
 	APIEndpoint string
 	CheckoutURL string
 	client      *http.Client
-	tokenCache  *tokenInfo
+	tokenCache  *AirWallexTokenInfo
 	tokenMutex  sync.RWMutex
-}
-
-type tokenInfo struct {
-	Token           string `json:"token"`
-	ExpiresAt       string `json:"expires_at"`
-	parsedExpiresAt time.Time
 }
 
 func NewAirwallexPaymentProvider(clientId string, apiKey string) (*AirwallexPaymentProvider, error) {
@@ -43,109 +37,37 @@ func NewAirwallexPaymentProvider(clientId string, apiKey string) (*AirwallexPaym
 	return pp, nil
 }
 
-type checkoutReq struct {
-	IntentId     string
-	ClientSecret string
-	Currency     string
-	SuccessURL   string
-	SessionId    string
-	FailUrl      string
-	LogoUrl      string
-}
-type productResp struct {
-	description string
-}
-
-// Ref: https://github.com/airwallex/airwallex-payment-demo/blob/master/docs/hpp.md
-func getCheckoutURL(p *checkoutReq, baseURL string) string {
-	url := fmt.Sprintf("%scurrency=%s&intent_id=%s&client_secret=%s&sessionId=%s&successUrl=%s&failUrl=%s&logoUrl=%s",
-		baseURL, p.Currency, p.IntentId, p.ClientSecret, p.SessionId, p.SuccessURL, p.FailUrl, p.LogoUrl)
-
-	return url
-}
-
-type intentResp struct {
-	Id           string `json:"id"`
-	ClientSecret string `json:"client_secret"`
-}
-
-func getCheckoutURL2(pp *AirwallexPaymentProvider, intent *intentResp, req *PayReq) string {
-	from, _ := url.Parse(req.ReturnUrl)
-
-	params := checkoutReq{
-		IntentId:     intent.Id,
-		ClientSecret: intent.ClientSecret,
-		Currency:     req.Currency,
-		SessionId:    req.PaymentName,
-		SuccessURL:   req.ReturnUrl,
-		FailUrl:      req.ReturnUrl,
-		LogoUrl:      from.Scheme + "://" + from.Host + "/favicon.ico", // replace Airwallex's default logo
-	}
-
-	return getCheckoutURL(&params, pp.CheckoutURL)
-}
-
-func (pp *AirwallexPaymentProvider) Pay(req *PayReq) (*PayResp, error) {
-	token, err := pp.getAccessToken()
+func (pp *AirwallexPaymentProvider) Pay(r *PayReq) (*PayResp, error) {
+	intent, err := pp.AirWallexIntentNew(r)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get access token: %v", err)
+		return nil, err
 	}
-	orderId := req.PaymentName
-	description := joinAttachString([]string{req.ProductName, req.ProductDisplayName, req.ProviderName})
-
-	// Create payment intent
-	intentReq := map[string]interface{}{
-		"request_id":        orderId,
-		"currency":          req.Currency,
-		"amount":            req.Price,
-		"merchant_order_id": orderId,
-		"name":              req.ProductDisplayName,
-		"descriptor":        description, // Not working as expected
-		"metadata":          map[string]interface{}{"description": description},
-		"order": map[string]interface{}{
-			"products": []map[string]interface{}{
-				{
-					"name":       req.ProductDisplayName,
-					"quantity":   1,
-					"desc":       "1" + req.ProductDescription,
-					"descriptor": description,
-					"image_url":  req.ProductImage,
-				},
-			},
-		},
+	// Create a Checkout URL (ref: https://www.airwallex.com/docs/js/payments/hosted-payment-page/)
+	logoUrl := "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="
+	if r.ReturnUrl != "" {
+		from, _ := url.Parse(r.ReturnUrl)
+		logoUrl = from.Host + "/favicon.ico"
 	}
-	fmt.Println("intentReq: ", intentReq)
-	intentUrl := fmt.Sprintf("%s/pa/payment_intents/create", pp.APIEndpoint)
-	intentRes, err := pp.doRequest("POST", intentUrl, token, intentReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create payment intent: %v", err)
+	p2 := map[string]interface{}{
+		"intent_id":     intent.Id,
+		"client_secret": intent.ClientSecret,
+		"sessionId":     r.PaymentName,
+		"currency":      r.Currency,
+		"successUrl":    r.ReturnUrl,
+		"failUrl":       r.ReturnUrl,
+		"logoUrl":       logoUrl, // replace default logo
 	}
-
-	// Convert map to intentResp
-	intent := &intentResp{
-		Id:           intentRes["id"].(string),
-		ClientSecret: intentRes["client_secret"].(string),
+	params := url.Values{}
+	for key, value := range p2 {
+		params.Add(key, fmt.Sprintf("%v", value))
 	}
-
-	// Create a checkout url (ref: https://www.airwallex.com/docs/js/payments/hosted-payment-page/)
-	params := checkoutReq{
-		IntentId:     intent.Id,
-		ClientSecret: intent.ClientSecret,
-		Currency:     req.Currency,
-		SessionId:    orderId,
-		SuccessURL:   req.ReturnUrl,
-		FailUrl:      req.ReturnUrl,
-		// LogoUrl:      from + "/favicon.ico", // replace Airwallex's default logo
-	}
-
 	payResp := &PayResp{
-		PayUrl:  getCheckoutURL2(pp, intent, req),
-		OrderId: params.IntentId,
+		PayUrl:  pp.CheckoutURL + params.Encode(),
+		OrderId: intent.Id,
 	}
 	return payResp, nil
 }
 
-// FailURL: http://localhost/return?error=default_backend_error&id=int_sgpdpllrch3ykrmtx6f&type=FAIL_URL
 func (pp *AirwallexPaymentProvider) Notify(body []byte, orderId string) (*NotifyResult, error) {
 	var notification map[string]interface{}
 	if err := json.Unmarshal(body, &notification); err != nil {
@@ -202,7 +124,23 @@ func (pp *AirwallexPaymentProvider) GetResponseError(err error) string {
 	return "fail"
 }
 
-func (pp *AirwallexPaymentProvider) getAccessToken() (string, error) {
+/*
+ * The following methods are Airwallex-specific implementations
+ * for handling authentication, API requests and payment intents.
+ */
+
+type AirWallexIntentResp struct {
+	Id           string `json:"id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+type AirWallexTokenInfo struct {
+	Token           string `json:"token"`
+	ExpiresAt       string `json:"expires_at"`
+	parsedExpiresAt time.Time
+}
+
+func (pp *AirwallexPaymentProvider) AirWallexTokenGet() (string, error) {
 	pp.tokenMutex.Lock()
 	defer pp.tokenMutex.Unlock()
 
@@ -225,7 +163,7 @@ func (pp *AirwallexPaymentProvider) getAccessToken() (string, error) {
 	}
 	defer resp.Body.Close()
 
-	var result tokenInfo
+	var result AirWallexTokenInfo
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
 	}
@@ -276,4 +214,31 @@ func (pp *AirwallexPaymentProvider) doRequest(method, url, token string, body in
 	}
 
 	return result, nil
+}
+
+// Create a payment intent
+func (pp *AirwallexPaymentProvider) AirWallexIntentNew(r *PayReq) (*AirWallexIntentResp, error) {
+	token, err := pp.AirWallexTokenGet()
+	if err != nil {
+		return nil, err
+	}
+	description := joinAttachString([]string{r.ProductName, r.ProductDisplayName, r.ProviderName})
+	intentReq := map[string]interface{}{
+		"request_id":        r.PaymentName,
+		"currency":          r.Currency,
+		"amount":            r.Price,
+		"merchant_order_id": r.PaymentName,
+		"descriptor":        description, // Not working
+		"metadata":          map[string]interface{}{"descriptor": description},
+		"order":             map[string]interface{}{"products": []map[string]interface{}{{"name": r.ProductDisplayName, "quantity": 1, "desc": r.ProductDescription, "image_url": r.ProductImage}}},
+	}
+	intentUrl := fmt.Sprintf("%s/pa/payment_intents/create", pp.APIEndpoint)
+	intentRes, err := pp.doRequest("POST", intentUrl, token, intentReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create payment intent: %v", err)
+	}
+	return &AirWallexIntentResp{
+		Id:           intentRes["id"].(string),
+		ClientSecret: intentRes["client_secret"].(string),
+	}, nil
 }

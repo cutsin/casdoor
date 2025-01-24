@@ -127,6 +127,12 @@ GET /api/v1/pa/payment_intents/[id]
 `sessionId` 约等于`OrderId`，casdoor里是`r.PaymentName`
 
 
+```sh
+失败回调：
+FailURL: http://localhost/return?error=default_backend_error&id=int_sgpdpllrch3ykrmtx6f&type=FAIL_URL
+```
+
+
 ## 收款链接
 
 1. **创建支付链接** [Create a PaymentLink](https://www.airwallex.com/docs/api?v=2024-08-07#/Payment_Acceptance/Payment_Links/_api_v1_pa_payment_links_create/post)
