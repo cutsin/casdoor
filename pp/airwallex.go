@@ -11,16 +11,6 @@ import (
 	"time"
 )
 
-type AirwallexClient struct {
-	ClientId    string
-	APIKey      string
-	APIEndpoint string
-	APICheckout string
-	client      *http.Client
-	tokenCache  *AirWallexTokenInfo
-	tokenMutex  sync.RWMutex
-}
-
 type AirwallexPaymentProvider struct {
 	Client *AirwallexClient
 }
@@ -31,7 +21,7 @@ func NewAirwallexPaymentProvider(clientId string, apiKey string) (*AirwallexPaym
 		APIKey:      apiKey,
 		APIEndpoint: "https://api.airwallex.com/api/v1",
 		APICheckout: "https://checkout.airwallex.com/#/standalone/checkout?",
-		client:      &http.Client{Timeout: 10 * time.Second},
+		client:      &http.Client{Timeout: 15 * time.Second},
 	}
 	pp := &AirwallexPaymentProvider{
 		Client: client,
@@ -89,7 +79,6 @@ func (pp *AirwallexPaymentProvider) Notify(body []byte, orderId string) (*Notify
 		notifyResult.NotifyMessage = fmt.Sprintf("unexpected airwallex checkout payment status: %v", intent.PaymentStatus+intent.Status)
 		return notifyResult, nil
 	}
-
 	// The Payment has succeeded.
 	var productDisplayName, productName, providerName string
 	if description, ok := intent.Metadata["description"]; ok {
@@ -119,8 +108,18 @@ func (pp *AirwallexPaymentProvider) GetResponseError(err error) string {
 }
 
 /*
- * Airwallex Client implementation
+ * Airwallex Client implementation (to be removed once the official SDK is released)
  */
+
+type AirwallexClient struct {
+	ClientId    string
+	APIKey      string
+	APIEndpoint string
+	APICheckout string
+	client      *http.Client
+	tokenCache  *AirWallexTokenInfo
+	tokenMutex  sync.RWMutex
+}
 
 type AirWallexTokenInfo struct {
 	Token           string `json:"token"`
@@ -147,43 +146,27 @@ type AirWallexIntentInfo struct {
 func (c *AirwallexClient) GetToken() (string, error) {
 	c.tokenMutex.Lock()
 	defer c.tokenMutex.Unlock()
-
 	if c.tokenCache != nil && time.Now().Before(c.tokenCache.parsedExpiresAt) {
 		return c.tokenCache.Token, nil
 	}
-
-	url := fmt.Sprintf("%s/authentication/login", c.APIEndpoint)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte("{}")))
-	if err != nil {
-		return "", err
-	}
-
+	req, _ := http.NewRequest("POST", c.APIEndpoint+"/authentication/login", bytes.NewBuffer([]byte("{}")))
 	req.Header.Set("x-client-id", c.ClientId)
 	req.Header.Set("x-api-key", c.APIKey)
-
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-
 	var result AirWallexTokenInfo
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
 	}
-
-	if result.Token == "" || result.ExpiresAt == "" {
-		return "", fmt.Errorf("invalid response: missing token or expires_at")
+	if result.Token == "" {
+		return "", fmt.Errorf("invalid token response")
 	}
-
-	expiresAt, err := time.Parse(time.RFC3339, strings.Replace(result.ExpiresAt, "+0000", "+00:00", 1))
-	if err != nil {
-		return "", fmt.Errorf("failed to parse expires_at: %v", err)
-	}
-
-	result.parsedExpiresAt = expiresAt
+	expiresAt := strings.Replace(result.ExpiresAt, "+0000", "+00:00", 1)
+	result.parsedExpiresAt, _ = time.Parse(time.RFC3339, expiresAt)
 	c.tokenCache = &result
-
 	return result.Token, nil
 }
 
