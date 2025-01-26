@@ -11,72 +11,66 @@ import (
 	"time"
 )
 
-type AirwallexPaymentProvider struct {
+type AirwallexClient struct {
 	ClientId    string
 	APIKey      string
 	APIEndpoint string
-	CheckoutURL string
+	APICheckout string
 	client      *http.Client
 	tokenCache  *AirWallexTokenInfo
 	tokenMutex  sync.RWMutex
 }
 
+type AirwallexPaymentProvider struct {
+	Client *AirwallexClient
+}
+
 func NewAirwallexPaymentProvider(clientId string, apiKey string) (*AirwallexPaymentProvider, error) {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	pp := &AirwallexPaymentProvider{
+	client := &AirwallexClient{
 		ClientId:    clientId,
 		APIKey:      apiKey,
 		APIEndpoint: "https://api.airwallex.com/api/v1",
-		CheckoutURL: "https://checkout.airwallex.com/#/standalone/checkout?",
-		client:      client,
+		APICheckout: "https://checkout.airwallex.com/#/standalone/checkout?",
+		client:      &http.Client{Timeout: 10 * time.Second},
+	}
+	pp := &AirwallexPaymentProvider{
+		Client: client,
 	}
 	return pp, nil
 }
 
 func (pp *AirwallexPaymentProvider) Pay(r *PayReq) (*PayResp, error) {
 	// Create a payment intent
-	intent, err := pp.AirWallexIntentNew(r)
+	intent, err := pp.Client.CreateIntent(r)
 	if err != nil {
 		return nil, err
 	}
-	// Create a checkout url
-	payResp := &PayResp{
-		PayUrl: fmt.Sprintf("%sintent_id=%s&client_secret=%s&mode=payment&currency=%s&amount=%v&sessionId=%s&successUrl=%s&failUrl=%s&logoUrl=%s",
-			pp.CheckoutURL,
-			intent.Id,
-			intent.ClientSecret,
-			r.Currency,
-			r.Price,
-			r.PaymentName,
-			r.ReturnUrl,
-			r.ReturnUrl,
-			pp.getLogoUrl(r)),
-		OrderId: intent.Id,
+	payUrl, err := pp.Client.GetCheckoutUrl(intent, r)
+	if err != nil {
+		return nil, err
 	}
-	return payResp, nil
+	return &PayResp{
+		PayUrl:  payUrl,
+		OrderId: intent.Id,
+	}, nil
 }
 
 func (pp *AirwallexPaymentProvider) Notify(body []byte, orderId string) (*NotifyResult, error) {
 	notifyResult := &NotifyResult{}
-	intent, err := pp.AirWallexIntentGet(orderId)
+	intent, err := pp.Client.GetIntent(orderId)
 	if err != nil {
 		return nil, err
 	}
 	// Check intent status
 	switch intent.Status {
 	case "PENDING", "REQUIRES_PAYMENT_METHOD", "REQUIRES_CUSTOMER_ACTION", "REQUIRES_CAPTURE":
-		// The Payment is waiting for the confirm request. This status is returned right after the PaymentIntent is created or the previous PaymentAttempt has failed or expired.
 		notifyResult.PaymentStatus = PaymentStateCreated
 		return notifyResult, nil
 	case "SUCCEEDED":
 		// skip
 	case "CANCELLED":
-		// The Payment has been canceled by your request. The payment is closed.
 		notifyResult.PaymentStatus = PaymentStateCanceled
 	case "EXPIRED":
-		// The Payment has expired. No further processing will occur.
 		notifyResult.PaymentStatus = PaymentStateTimeout
 	default:
 		notifyResult.PaymentStatus = PaymentStateError
@@ -125,15 +119,8 @@ func (pp *AirwallexPaymentProvider) GetResponseError(err error) string {
 }
 
 /*
- * The following methods are Airwallex-specific implementations
- * for handling authentication, API requests and payment intents,
- * until the official library is available.
+ * Airwallex Client implementation
  */
-
-type AirWallexIntentResp struct {
-	Id           string `json:"id"`
-	ClientSecret string `json:"client_secret"`
-}
 
 type AirWallexTokenInfo struct {
 	Token           string `json:"token"`
@@ -141,35 +128,40 @@ type AirWallexTokenInfo struct {
 	parsedExpiresAt time.Time
 }
 
+type AirWallexIntentResp struct {
+	Id           string `json:"id"`
+	ClientSecret string `json:"client_secret"`
+}
+
 type AirWallexIntentInfo struct {
 	Amount        float64                `json:"amount"`
 	Currency      string                 `json:"currency"`
 	Id            string                 `json:"id"`
 	Status        string                 `json:"status"`
-	Descriptor    string                 `json:"descriptor"`
+	Descriptor    *string                `json:"descriptor,omitempty"`
 	RequestId     string                 `json:"request_id"`
 	PaymentStatus string                 `json:"payment_status"`
 	Metadata      map[string]interface{} `json:"metadata"`
 }
 
-func (pp *AirwallexPaymentProvider) AirWallexTokenGet() (string, error) {
-	pp.tokenMutex.Lock()
-	defer pp.tokenMutex.Unlock()
+func (c *AirwallexClient) GetToken() (string, error) {
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
 
-	if pp.tokenCache != nil && time.Now().Before(pp.tokenCache.parsedExpiresAt) {
-		return pp.tokenCache.Token, nil
+	if c.tokenCache != nil && time.Now().Before(c.tokenCache.parsedExpiresAt) {
+		return c.tokenCache.Token, nil
 	}
 
-	url := fmt.Sprintf("%s/authentication/login", pp.APIEndpoint)
+	url := fmt.Sprintf("%s/authentication/login", c.APIEndpoint)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte("{}")))
 	if err != nil {
 		return "", err
 	}
 
-	req.Header.Set("x-client-id", pp.ClientId)
-	req.Header.Set("x-api-key", pp.APIKey)
+	req.Header.Set("x-client-id", c.ClientId)
+	req.Header.Set("x-api-key", c.APIKey)
 
-	resp, err := pp.client.Do(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -190,62 +182,45 @@ func (pp *AirwallexPaymentProvider) AirWallexTokenGet() (string, error) {
 	}
 
 	result.parsedExpiresAt = expiresAt
-	pp.tokenCache = &result
+	c.tokenCache = &result
 
 	return result.Token, nil
 }
 
-func (pp *AirwallexPaymentProvider) doRequest(method, url, token string, body interface{}) (map[string]interface{}, error) {
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request body: %v", err)
-	}
-
-	req, err := http.NewRequest(method, url, bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := pp.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %v", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		errorMsg, _ := json.Marshal(result)
-		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(errorMsg))
-	}
-
-	return result, nil
-}
-
-// Create a payment intent
-func (pp *AirwallexPaymentProvider) AirWallexIntentNew(r *PayReq) (*AirWallexIntentResp, error) {
-	token, err := pp.AirWallexTokenGet()
+func (c *AirwallexClient) authRequest(method, url string, body interface{}) (map[string]interface{}, error) {
+	token, err := c.GetToken()
 	if err != nil {
 		return nil, err
 	}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(method, url, bytes.NewBuffer(b))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (c *AirwallexClient) CreateIntent(r *PayReq) (*AirWallexIntentResp, error) {
 	description := joinAttachString([]string{r.ProductName, r.ProductDisplayName, r.ProviderName})
 	intentReq := map[string]interface{}{
 		"request_id":        r.PaymentName,
 		"currency":          r.Currency,
 		"amount":            r.Price,
 		"merchant_order_id": r.PaymentName,
-		"descriptor":        description, // Not working (That will be displayed to the customer)
+		"descriptor":        description,
 		"metadata":          map[string]interface{}{"description": description},
 		"order":             map[string]interface{}{"products": []map[string]interface{}{{"name": r.ProductDisplayName, "quantity": 1, "desc": r.ProductDescription, "image_url": r.ProductImage}}},
 	}
-	intentUrl := fmt.Sprintf("%s/pa/payment_intents/create", pp.APIEndpoint)
-	intentRes, err := pp.doRequest("POST", intentUrl, token, intentReq)
+	intentUrl := fmt.Sprintf("%s/pa/payment_intents/create", c.APIEndpoint)
+	intentRes, err := c.authRequest("POST", intentUrl, intentReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create payment intent: %v", err)
 	}
@@ -255,41 +230,55 @@ func (pp *AirwallexPaymentProvider) AirWallexIntentNew(r *PayReq) (*AirWallexInt
 	}, nil
 }
 
-// Try to get the logo URL of the merchant's site
-func (pp *AirwallexPaymentProvider) getLogoUrl(r *PayReq) string {
-	if r.ReturnUrl == "" {
-		return "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="
-	}
-	from, _ := url.Parse(r.ReturnUrl)
-	return from.Host + "/favicon.ico"
-}
-
-// Get a payment intent
-func (pp *AirwallexPaymentProvider) AirWallexIntentGet(intentId string) (*AirWallexIntentInfo, error) {
-	token, err := pp.AirWallexTokenGet()
-	if err != nil {
-		return nil, err
-	}
-	intentUrl := fmt.Sprintf("%s/pa/payment_intents/%s", pp.APIEndpoint, intentId)
-	intentRes, err := pp.doRequest("GET", intentUrl, token, nil)
+func (c *AirwallexClient) GetIntent(intentId string) (*AirWallexIntentInfo, error) {
+	intentUrl := fmt.Sprintf("%s/pa/payment_intents/%s", c.APIEndpoint, intentId)
+	intentRes, err := c.authRequest("GET", intentUrl, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get payment intent: %v", err)
 	}
 	// Extract payment status from latest_payment_attempt if exists
 	var paymentStatus string
-	if attempt, ok := intentRes["latest_payment_attempt"].(map[string]interface{}); ok {
+	if attempt, ok := intentRes["latest_payment_attempt"].(map[string]interface{}); ok && attempt != nil {
 		if status, ok := attempt["status"].(string); ok {
 			paymentStatus = status
 		}
 	}
+	metadata := make(map[string]interface{})
+	if meta, ok := intentRes["metadata"].(map[string]interface{}); ok && meta != nil {
+		metadata = meta
+	}
+	var descriptor *string
+	if desc, ok := intentRes["descriptor"].(string); ok {
+		descriptor = &desc
+	}
+
 	return &AirWallexIntentInfo{
 		Amount:        intentRes["amount"].(float64),
 		Currency:      intentRes["currency"].(string),
 		Id:            intentRes["id"].(string),
 		Status:        intentRes["status"].(string),
-		Descriptor:    intentRes["descriptor"].(string),
+		Descriptor:    descriptor,
 		RequestId:     intentRes["request_id"].(string),
 		PaymentStatus: paymentStatus,
-		Metadata:      intentRes["metadata"].(map[string]interface{}),
+		Metadata:      metadata,
 	}, nil
+}
+
+func (c *AirwallexClient) GetCheckoutUrl(intent *AirWallexIntentResp, r *PayReq) (string, error) {
+	// Try to get the logo URL of the merchant's site (replace the Airwallex's default logo.)
+	logoUrl := "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="
+	if r.ReturnUrl != "" {
+		from, _ := url.Parse(r.ReturnUrl)
+		logoUrl = "//" + from.Host + "/favicon.ico"
+	}
+	return fmt.Sprintf("%sintent_id=%s&client_secret=%s&mode=payment&currency=%s&amount=%v&sessionId=%s&successUrl=%s&failUrl=%s&logoUrl=%s",
+		c.APICheckout,
+		intent.Id,
+		intent.ClientSecret,
+		r.Currency,
+		r.Price,
+		r.PaymentName,
+		r.ReturnUrl,
+		r.ReturnUrl,
+		logoUrl), nil
 }

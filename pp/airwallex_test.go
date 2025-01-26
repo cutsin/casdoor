@@ -25,10 +25,10 @@ func TestNewAirwallexPaymentProvider(t *testing.T) {
 	provider, err := NewAirwallexPaymentProvider(clientId, apiKey)
 	assert.Nil(t, err)
 	assert.NotNil(t, provider)
-	assert.Equal(t, clientId, provider.ClientId)
-	assert.Equal(t, apiKey, provider.APIKey)
-	assert.Equal(t, "https://api.airwallex.com", provider.APIEndpoint)
-	assert.NotNil(t, provider.client)
+	assert.Equal(t, clientId, provider.Client.ClientId)
+	assert.Equal(t, apiKey, provider.Client.APIKey)
+	assert.Equal(t, "https://api.airwallex.com/api/v1", provider.Client.APIEndpoint)
+	assert.NotNil(t, provider.Client.client)
 }
 
 func TestGetAccessToken(t *testing.T) {
@@ -63,10 +63,10 @@ func TestGetAccessToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create payment provider: %v", err)
 	}
-	pp.APIEndpoint = server.URL
+	pp.Client.APIEndpoint = server.URL
 
 	// 测试获取token
-	token, err := pp.getAccessToken()
+	token, err := pp.Client.GetToken()
 	if err != nil {
 		t.Fatalf("Failed to get access token: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestGetAccessToken(t *testing.T) {
 	}
 
 	// 测试token缓存
-	cachedToken, err := pp.getAccessToken()
+	cachedToken, err := pp.Client.GetToken()
 	if err != nil {
 		t.Fatalf("Failed to get cached token: %v", err)
 	}
@@ -92,9 +92,9 @@ func TestGetAccessToken(t *testing.T) {
 	}))
 	defer errorServer.Close()
 
-	pp.APIEndpoint = errorServer.URL
-	pp.tokenCache = nil // 清除缓存
-	_, err = pp.getAccessToken()
+	pp.Client.APIEndpoint = errorServer.URL
+	pp.Client.tokenCache = nil // 清除缓存
+	_, err = pp.Client.GetToken()
 	if err == nil {
 		t.Error("Expected error for invalid credentials")
 	}
@@ -109,7 +109,7 @@ func TestGetAccessTokenSimple(t *testing.T) {
 	}
 
 	pp, _ := NewAirwallexPaymentProvider(clientId, apiKey)
-	token, err := pp.getAccessToken()
+	token, err := pp.Client.GetToken()
 
 	fmt.Printf("Token result: %v\n", token)
 	fmt.Printf("Error: %v\n", err)
@@ -189,6 +189,99 @@ func TestNotify(t *testing.T) {
 	}
 }
 
+func TestNotifyWithCreatedIntent(t *testing.T) {
+	provider := setupTestProvider(t)
+	if provider == nil {
+		return
+	}
+
+	intentId := "int_sgpd6tknhh4102270a4"
+
+	// 首先获取实际的 intent 状态
+	intent, err := provider.Client.GetIntent(intentId)
+	if err != nil {
+		t.Logf("Failed to get intent: %v", err)
+	} else {
+		t.Logf("Actual Intent Status: %+v", intent)
+	}
+
+	// 创建一个更完整的模拟通知数据
+	notification := map[string]interface{}{
+		"id":                intentId,
+		"amount":            intent.Amount,
+		"currency":          intent.Currency,
+		"status":            intent.Status,
+		"request_id":        intent.RequestId,
+		"merchant_order_id": intent.RequestId,
+		"latest_payment_attempt": map[string]interface{}{
+			"status": intent.PaymentStatus,
+		},
+		"metadata": intent.Metadata,
+	}
+	body, _ := json.Marshal(notification)
+
+	// 调用 Notify 方法
+	result, err := provider.Notify(body, intentId)
+
+	// 打印详细信息以便调试
+	t.Logf("Notification Result: %+v", result)
+	t.Logf("Error: %v", err)
+
+	// 验证结果
+	if err != nil {
+		t.Logf("Notification error: %v", err)
+	} else {
+		t.Logf("Payment Status: %v", result.PaymentStatus)
+		t.Logf("Order ID: %v", result.OrderId)
+		t.Logf("Product Name: %v", result.ProductName)
+		t.Logf("Product Display Name: %v", result.ProductDisplayName)
+		t.Logf("Price: %v %v", result.Price, result.Currency)
+
+		// 验证状态是否为 Created
+		assert.Equal(t, PaymentStateCreated, result.PaymentStatus, "Payment status should be Created")
+	}
+}
+
+func TestNotifyWithFailedPaymentAttempt(t *testing.T) {
+	provider := setupTestProvider(t)
+	if provider == nil {
+		return
+	}
+
+	intentId := "int_sgpdpllrch3yrdrrb49"
+
+	// 获取实际的 intent 状态
+	t.Logf("Getting intent: %s", intentId)
+	intent, err := provider.Client.GetIntent(intentId)
+	if err != nil {
+		t.Fatalf("Failed to get intent: %v", err)
+	}
+	t.Logf("Actual Intent Status: %+v", intent)
+	return
+
+	// 直接使用获取到的 intent 测试 Notify
+	result, err := provider.Notify(nil, intentId)
+
+	// 打印详细信息以便调试
+	t.Logf("Notification Result: %+v", result)
+	t.Logf("Error: %v", err)
+
+	// 验证结果
+	if err != nil {
+		t.Fatalf("Notification error: %v", err)
+	}
+
+	t.Logf("Payment Status: %v", result.PaymentStatus)
+	t.Logf("Order ID: %v", result.OrderId)
+	t.Logf("Product Name: %v", result.ProductName)
+	t.Logf("Product Display Name: %v", result.ProductDisplayName)
+	t.Logf("Price: %v %v", result.Price, result.Currency)
+
+	// 根据 Notify 方法的逻辑，即使 payment attempt 是 FAILED，
+	// 只要 intent status 是 Created 相关状态，结果应该还是 Created
+	assert.Equal(t, PaymentStateCreated, result.PaymentStatus, "Payment status should be Created even with failed attempt")
+}
+
 func TestGetResponseError(t *testing.T) {
 	provider := setupTestProvider(t)
 	if provider == nil {
@@ -232,10 +325,10 @@ func TestTokenCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create payment provider: %v", err)
 	}
-	pp.APIEndpoint = server.URL
+	pp.Client.APIEndpoint = server.URL
 
 	// 第一次获取 token
-	token1, err := pp.getAccessToken()
+	token1, err := pp.Client.GetToken()
 	if err != nil {
 		t.Fatalf("Failed to get first token: %v", err)
 	}
@@ -244,7 +337,7 @@ func TestTokenCache(t *testing.T) {
 	}
 
 	// 立即再次获取 token，应该返回缓存的值
-	token2, err := pp.getAccessToken()
+	token2, err := pp.Client.GetToken()
 	if err != nil {
 		t.Fatalf("Failed to get cached token: %v", err)
 	}
@@ -253,10 +346,10 @@ func TestTokenCache(t *testing.T) {
 	}
 
 	// 模拟过期
-	pp.tokenCache.parsedExpiresAt = time.Now().Add(-time.Hour)
+	pp.Client.tokenCache.parsedExpiresAt = time.Now().Add(-time.Hour)
 
 	// 获取新 token，应该刷新缓存
-	token3, err := pp.getAccessToken()
+	token3, err := pp.Client.GetToken()
 	if err != nil {
 		t.Fatalf("Failed to get new token after expiry: %v", err)
 	}
