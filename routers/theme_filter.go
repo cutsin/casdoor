@@ -23,79 +23,97 @@ import (
 	"github.com/casdoor/casdoor/object"
 )
 
-func appendThemeCookie(ctx *context.Context, urlPath string) error {
+type OrganizationThemeCookie struct {
+	ThemeData   *object.ThemeData
+	LogoUrl     string
+	FooterHtml  string
+	Favicon     string
+	DisplayName string
+}
+
+func appendThemeCookie(ctx *context.Context, urlPath string) (*OrganizationThemeCookie, error) {
+	organizationThemeCookie, err := getOrganizationThemeCookieFromUrlPath(ctx, urlPath)
+	if err != nil {
+		return nil, err
+	}
+	if organizationThemeCookie != nil {
+		return organizationThemeCookie, setThemeDataCookie(ctx, organizationThemeCookie)
+	}
+
+	return nil, nil
+}
+
+func getOrganizationThemeCookieFromUrlPath(ctx *context.Context, urlPath string) (*OrganizationThemeCookie, error) {
+	var application *object.Application
+	var organization *object.Organization
+	var err error
 	if urlPath == "/login" {
-		application, err := object.GetDefaultApplication(fmt.Sprintf("admin/built-in"))
+		application, err = object.GetDefaultApplication(fmt.Sprintf("admin/built-in"))
 		if err != nil {
-			return err
-		}
-		if application.ThemeData != nil {
-			return setThemeDataCookie(ctx, application.ThemeData, application.Logo, application.FooterHtml)
-		}
-		organization := application.OrganizationObj
-		if organization == nil {
-			organization, err = object.GetOrganization(fmt.Sprintf("admin/built-in"))
-			if err != nil {
-				return err
-			}
-		}
-		if organization != nil {
-			return setThemeDataCookie(ctx, organization.ThemeData, organization.Logo, application.FooterHtml)
+			return nil, err
 		}
 	} else if strings.HasPrefix(urlPath, "/login/oauth/authorize") {
 		clientId := ctx.Input.Query("client_id")
 		if clientId == "" {
-			return nil
+			return nil, nil
 		}
-		application, err := object.GetApplicationByClientId(clientId)
+		application, err = object.GetApplicationByClientId(clientId)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if application != nil {
-			organization, err := object.GetOrganization(fmt.Sprintf("admin/%s", application.Organization))
-			if err != nil {
-				return err
-			}
-			if application.ThemeData != nil {
-				return setThemeDataCookie(ctx, application.ThemeData, application.Logo, application.FooterHtml)
-			}
-			if organization != nil {
-				return setThemeDataCookie(ctx, organization.ThemeData, organization.Logo, application.FooterHtml)
-			}
+	} else if strings.HasPrefix(urlPath, "/login/saml") {
+		owner, _ := strings.CutPrefix(urlPath, "/login/saml/authorize/")
+		application, err = object.GetApplication(owner)
+		if err != nil {
+			return nil, err
 		}
 	} else if strings.HasPrefix(urlPath, "/login/") {
-		owner := strings.Replace(urlPath, "/login/", "", -1)
-		if owner != "undefined" && owner != "oauth/undefined" {
-			application, err := object.GetDefaultApplication(fmt.Sprintf("admin/%s", owner))
-			if err != nil {
-				return err
-			}
-			if application.ThemeData != nil {
-				return setThemeDataCookie(ctx, application.ThemeData, application.Logo, application.FooterHtml)
-			}
-			organization := application.OrganizationObj
-			if organization == nil {
-				organization, err = object.GetOrganization(fmt.Sprintf("admin/%s", owner))
-				if err != nil {
-					return err
-				}
-			}
-			if organization != nil {
-				return setThemeDataCookie(ctx, organization.ThemeData, organization.Logo, application.FooterHtml)
-			}
+		owner, _ := strings.CutPrefix(urlPath, "/login/")
+		if owner == "undefined" || strings.Count(owner, "/") > 0 {
+			return nil, nil
+		}
+		application, err = object.GetDefaultApplication(fmt.Sprintf("admin/%s", owner))
+		if err != nil {
+			return nil, err
+		}
+	} else if strings.HasPrefix(urlPath, "/cas/") && strings.HasSuffix(urlPath, "/login") {
+		owner, _ := strings.CutPrefix(urlPath, "/cas/")
+		owner, _ = strings.CutSuffix(owner, "/login")
+		application, err = object.GetApplication(owner)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	return nil
+	if application == nil {
+		return nil, nil
+	}
+	organization = application.OrganizationObj
+	if organization == nil {
+		organization, err = object.GetOrganization(fmt.Sprintf("admin/%s", application.Organization))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	organizationThemeCookie := &OrganizationThemeCookie{
+		application.ThemeData,
+		application.Logo,
+		application.FooterHtml,
+		organization.Favicon,
+		organization.DisplayName,
+	}
+
+	return organizationThemeCookie, nil
 }
 
-func setThemeDataCookie(ctx *context.Context, themeData *object.ThemeData, logoUrl string, footerHtml string) error {
-	themeDataString, err := json.Marshal(themeData)
+func setThemeDataCookie(ctx *context.Context, organizationThemeCookie *OrganizationThemeCookie) error {
+	themeDataString, err := json.Marshal(organizationThemeCookie.ThemeData)
 	if err != nil {
 		return err
 	}
 	ctx.SetCookie("organizationTheme", string(themeDataString))
-	ctx.SetCookie("organizationLogo", logoUrl)
-	ctx.SetCookie("organizationFootHtml", footerHtml)
+	ctx.SetCookie("organizationLogo", organizationThemeCookie.LogoUrl)
+	ctx.SetCookie("organizationFootHtml", organizationThemeCookie.FooterHtml)
 	return nil
 }
