@@ -43,11 +43,6 @@ func (pp *AirwallexPaymentProvider) Pay(r *PayReq) (*PayResp, error) {
 		return nil, err
 	}
 	// Create a Checkout URL (ref: https://www.airwallex.com/docs/js/payments/hosted-payment-page/)
-	logoUrl := "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="
-	if r.ReturnUrl != "" {
-		from, _ := url.Parse(r.ReturnUrl)
-		logoUrl = from.Host + "/favicon.ico"
-	}
 	p2 := map[string]interface{}{
 		"intent_id":     intent.Id,
 		"client_secret": intent.ClientSecret,
@@ -55,7 +50,7 @@ func (pp *AirwallexPaymentProvider) Pay(r *PayReq) (*PayResp, error) {
 		"currency":      r.Currency,
 		"successUrl":    r.ReturnUrl,
 		"failUrl":       r.ReturnUrl,
-		"logoUrl":       logoUrl, // replace default logo
+		"logoUrl":       pp.getLogoUrl(r), // Replace the potentially misleading Airwallex's logo.
 	}
 	params := url.Values{}
 	for key, value := range p2 {
@@ -241,4 +236,13 @@ func (pp *AirwallexPaymentProvider) AirWallexIntentNew(r *PayReq) (*AirWallexInt
 		Id:           intentRes["id"].(string),
 		ClientSecret: intentRes["client_secret"].(string),
 	}, nil
+}
+
+// Try to get the logo URL of the merchant's site
+func (pp *AirwallexPaymentProvider) getLogoUrl(r *PayReq) string {
+	if r.ReturnUrl == "" {
+		return "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="
+	}
+	from, _ := url.Parse(r.ReturnUrl)
+	return from.Host + "/favicon.ico"
 }
