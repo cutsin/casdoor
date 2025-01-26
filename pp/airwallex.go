@@ -9,8 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	// "io/ioutil"
-	// "github.com/casdoor/casdoor/conf"
 )
 
 type AirwallexPaymentProvider struct {
@@ -38,73 +36,80 @@ func NewAirwallexPaymentProvider(clientId string, apiKey string) (*AirwallexPaym
 }
 
 func (pp *AirwallexPaymentProvider) Pay(r *PayReq) (*PayResp, error) {
+	// Create a payment intent
 	intent, err := pp.AirWallexIntentNew(r)
 	if err != nil {
 		return nil, err
 	}
-	// Create a Checkout URL (ref: https://www.airwallex.com/docs/js/payments/hosted-payment-page/)
-	p2 := map[string]interface{}{
-		"intent_id":     intent.Id,
-		"client_secret": intent.ClientSecret,
-		"sessionId":     r.PaymentName,
-		"currency":      r.Currency,
-		"successUrl":    r.ReturnUrl,
-		"failUrl":       r.ReturnUrl,
-		"logoUrl":       pp.getLogoUrl(r), // Replace the potentially misleading Airwallex's logo.
-	}
-	params := url.Values{}
-	for key, value := range p2 {
-		params.Add(key, fmt.Sprintf("%v", value))
-	}
+	// Create a checkout url
 	payResp := &PayResp{
-		PayUrl:  pp.CheckoutURL + params.Encode(),
+		PayUrl: fmt.Sprintf("%sintent_id=%s&client_secret=%s&mode=payment&currency=%s&amount=%v&sessionId=%s&successUrl=%s&failUrl=%s&logoUrl=%s",
+			pp.CheckoutURL,
+			intent.Id,
+			intent.ClientSecret,
+			r.Currency,
+			r.Price,
+			r.PaymentName,
+			r.ReturnUrl,
+			r.ReturnUrl,
+			pp.getLogoUrl(r)),
 		OrderId: intent.Id,
 	}
 	return payResp, nil
 }
 
 func (pp *AirwallexPaymentProvider) Notify(body []byte, orderId string) (*NotifyResult, error) {
-	var notification map[string]interface{}
-	if err := json.Unmarshal(body, &notification); err != nil {
+	notifyResult := &NotifyResult{}
+	intent, err := pp.AirWallexIntentGet(orderId)
+	if err != nil {
 		return nil, err
 	}
-
-	statusStr, ok := notification["status"].(string)
-	if !ok {
-		return nil, fmt.Errorf("invalid status in notification")
-	}
-
-	paymentStatus := PaymentStateError
-	switch statusStr {
+	// Check intent status
+	switch intent.Status {
+	case "PENDING", "REQUIRES_PAYMENT_METHOD", "REQUIRES_CUSTOMER_ACTION", "REQUIRES_CAPTURE":
+		// The Payment is waiting for the confirm request. This status is returned right after the PaymentIntent is created or the previous PaymentAttempt has failed or expired.
+		notifyResult.PaymentStatus = PaymentStateCreated
+		return notifyResult, nil
 	case "SUCCEEDED":
-		paymentStatus = PaymentStatePaid
-	case "FAILED", "CANCELLED":
-		paymentStatus = PaymentStateError
+		// skip
+	case "CANCELLED":
+		// The Payment has been canceled by your request. The payment is closed.
+		notifyResult.PaymentStatus = PaymentStateCanceled
 	case "EXPIRED":
-		paymentStatus = PaymentStateTimeout
-	case "PENDING", "REQUIRES_PAYMENT_METHOD", "REQUIRES_CUSTOMER_ACTION":
-		paymentStatus = PaymentStateCreated
+		// The Payment has expired. No further processing will occur.
+		notifyResult.PaymentStatus = PaymentStateTimeout
+	default:
+		notifyResult.PaymentStatus = PaymentStateError
+		notifyResult.NotifyMessage = fmt.Sprintf("unexpected airwallex checkout status: %v", intent.PaymentStatus+intent.Status)
+		return notifyResult, nil
+	}
+	// Check attempt status
+	switch intent.PaymentStatus {
+	case "PAID", "SETTLED":
+		// Skip
+	case "CANCELLED", "EXPIRED", "RECEIVED", "AUTHENTICATION_REDIRECTED", "AUTHORIZED", "CAPTURE_REQUESTED":
+		notifyResult.PaymentStatus = PaymentStateCreated
+		return notifyResult, nil
+	default:
+		notifyResult.PaymentStatus = PaymentStateError
+		notifyResult.NotifyMessage = fmt.Sprintf("unexpected airwallex checkout payment status: %v", intent.PaymentStatus+intent.Status)
+		return notifyResult, nil
 	}
 
-	amount, _ := notification["amount"].(float64)
-	currency, _ := notification["currency"].(string)
-	descriptor, _ := notification["descriptor"].(string)
-
+	// The Payment has succeeded.
 	var productDisplayName, productName, providerName string
-	if descriptor != "" {
-		productDisplayName, productName, providerName, _ = parseAttachString(descriptor)
+	if description, ok := intent.Metadata["description"]; ok {
+		productName, productDisplayName, providerName, _ = parseAttachString(description.(string))
 	}
-
 	return &NotifyResult{
-		PaymentName:        "Airwallex",
-		PaymentStatus:      paymentStatus,
-		NotifyMessage:      string(body),
-		OrderId:            orderId,
-		Price:              amount,
-		Currency:           currency,
+		PaymentName:        intent.RequestId,
+		PaymentStatus:      PaymentStatePaid,
 		ProductName:        productName,
 		ProductDisplayName: productDisplayName,
 		ProviderName:       providerName,
+		Price:              intent.Amount,
+		Currency:           intent.Currency,
+		OrderId:            intent.RequestId,
 	}, nil
 }
 
@@ -121,7 +126,8 @@ func (pp *AirwallexPaymentProvider) GetResponseError(err error) string {
 
 /*
  * The following methods are Airwallex-specific implementations
- * for handling authentication, API requests and payment intents.
+ * for handling authentication, API requests and payment intents,
+ * until the official library is available.
  */
 
 type AirWallexIntentResp struct {
@@ -133,6 +139,17 @@ type AirWallexTokenInfo struct {
 	Token           string `json:"token"`
 	ExpiresAt       string `json:"expires_at"`
 	parsedExpiresAt time.Time
+}
+
+type AirWallexIntentInfo struct {
+	Amount        float64                `json:"amount"`
+	Currency      string                 `json:"currency"`
+	Id            string                 `json:"id"`
+	Status        string                 `json:"status"`
+	Descriptor    string                 `json:"descriptor"`
+	RequestId     string                 `json:"request_id"`
+	PaymentStatus string                 `json:"payment_status"`
+	Metadata      map[string]interface{} `json:"metadata"`
 }
 
 func (pp *AirwallexPaymentProvider) AirWallexTokenGet() (string, error) {
@@ -223,8 +240,8 @@ func (pp *AirwallexPaymentProvider) AirWallexIntentNew(r *PayReq) (*AirWallexInt
 		"currency":          r.Currency,
 		"amount":            r.Price,
 		"merchant_order_id": r.PaymentName,
-		"descriptor":        description, // Not working
-		"metadata":          map[string]interface{}{"descriptor": description},
+		"descriptor":        description, // Not working (That will be displayed to the customer)
+		"metadata":          map[string]interface{}{"description": description},
 		"order":             map[string]interface{}{"products": []map[string]interface{}{{"name": r.ProductDisplayName, "quantity": 1, "desc": r.ProductDescription, "image_url": r.ProductImage}}},
 	}
 	intentUrl := fmt.Sprintf("%s/pa/payment_intents/create", pp.APIEndpoint)
@@ -245,4 +262,34 @@ func (pp *AirwallexPaymentProvider) getLogoUrl(r *PayReq) string {
 	}
 	from, _ := url.Parse(r.ReturnUrl)
 	return from.Host + "/favicon.ico"
+}
+
+// Get a payment intent
+func (pp *AirwallexPaymentProvider) AirWallexIntentGet(intentId string) (*AirWallexIntentInfo, error) {
+	token, err := pp.AirWallexTokenGet()
+	if err != nil {
+		return nil, err
+	}
+	intentUrl := fmt.Sprintf("%s/pa/payment_intents/%s", pp.APIEndpoint, intentId)
+	intentRes, err := pp.doRequest("GET", intentUrl, token, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get payment intent: %v", err)
+	}
+	// Extract payment status from latest_payment_attempt if exists
+	var paymentStatus string
+	if attempt, ok := intentRes["latest_payment_attempt"].(map[string]interface{}); ok {
+		if status, ok := attempt["status"].(string); ok {
+			paymentStatus = status
+		}
+	}
+	return &AirWallexIntentInfo{
+		Amount:        intentRes["amount"].(float64),
+		Currency:      intentRes["currency"].(string),
+		Id:            intentRes["id"].(string),
+		Status:        intentRes["status"].(string),
+		Descriptor:    intentRes["descriptor"].(string),
+		RequestId:     intentRes["request_id"].(string),
+		PaymentStatus: paymentStatus,
+		Metadata:      intentRes["metadata"].(map[string]interface{}),
+	}, nil
 }
