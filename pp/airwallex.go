@@ -273,13 +273,12 @@ func (c *AirwallexClient) GetIntentByOrderId(orderId string) (*AirWallexIntentIn
 }
 
 func (c *AirwallexClient) GetCheckoutUrl(intent *AirWallexIntentResp, r *PayReq) (string, error) {
-	return fmt.Sprintf("%sintent_id=%s&client_secret=%s&mode=payment&currency=%s&amount=%v&sessionId=%s&successUrl=%s&failUrl=%s&logoUrl=%s",
+	return fmt.Sprintf("%sintent_id=%s&client_secret=%s&mode=payment&currency=%s&amount=%v&successUrl=%s&failUrl=%s&logoUrl=%s",
 		c.APICheckout,
 		intent.Id,
 		intent.ClientSecret,
 		r.Currency,
 		r.Price,
-		intent.MerchantOrderId,
 		r.ReturnUrl,
 		r.ReturnUrl,
 		"data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=", // replace default logo
