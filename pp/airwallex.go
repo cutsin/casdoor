@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/casdoor/casdoor/conf"
 )
 
 type AirwallexPaymentProvider struct {
@@ -15,11 +17,18 @@ type AirwallexPaymentProvider struct {
 }
 
 func NewAirwallexPaymentProvider(clientId string, apiKey string) (*AirwallexPaymentProvider, error) {
+	isProd := conf.GetConfigString("runmode") == "prod"
+	apiEndpoint := "https://api-demo.airwallex.com/api/v1"
+	apiCheckout := "https://checkout-demo.airwallex.com/#/standalone/checkout?"
+	if isProd {
+		apiEndpoint = "https://api.airwallex.com/api/v1"
+		apiCheckout = "https://checkout.airwallex.com/#/standalone/checkout?"
+	}
 	client := &AirwallexClient{
 		ClientId:    clientId,
 		APIKey:      apiKey,
-		APIEndpoint: "https://api.airwallex.com/api/v1",
-		APICheckout: "https://checkout.airwallex.com/#/standalone/checkout?",
+		APIEndpoint: apiEndpoint,
+		APICheckout: apiCheckout,
 		client:      &http.Client{Timeout: 15 * time.Second},
 	}
 	pp := &AirwallexPaymentProvider{
@@ -62,7 +71,7 @@ func (pp *AirwallexPaymentProvider) Notify(body []byte, orderId string) (*Notify
 		notifyResult.PaymentStatus = PaymentStateTimeout
 		return notifyResult, nil
 	case "SUCCEEDED":
-		// skip
+		// Skip
 	default:
 		notifyResult.PaymentStatus = PaymentStateError
 		notifyResult.NotifyMessage = fmt.Sprintf("unexpected airwallex checkout status: %v", intent.Status)
@@ -94,7 +103,7 @@ func (pp *AirwallexPaymentProvider) Notify(body []byte, orderId string) (*Notify
 		ProductName:        productName,
 		ProductDisplayName: productDisplayName,
 		ProviderName:       providerName,
-		Price:              intent.Amount,
+		Price:              priceStringToFloat64(intent.Amount.String()),
 		Currency:           intent.Currency,
 		OrderId:            orderId,
 	}, nil
@@ -112,7 +121,7 @@ func (pp *AirwallexPaymentProvider) GetResponseError(err error) string {
 }
 
 /*
- * Airwallex Client implementation (to be removed once the official SDK is released)
+ * Airwallex Client implementation (to be removed upon official SDK release)
  */
 
 type AirwallexClient struct {
@@ -210,13 +219,13 @@ func (c *AirwallexClient) CreateIntent(r *PayReq) (*AirWallexIntentResp, error) 
 }
 
 type AirwallexIntent struct {
-	Amount               float64 `json:"amount"`
-	Currency             string  `json:"currency"`
-	Id                   string  `json:"id"`
-	Status               string  `json:"status"`
-	Descriptor           string  `json:"descriptor"`
-	MerchantOrderId      string  `json:"merchant_order_id"`
-	LatestPaymentAttempt *struct {
+	Amount               json.Number `json:"amount"`
+	Currency             string      `json:"currency"`
+	Id                   string      `json:"id"`
+	Status               string      `json:"status"`
+	Descriptor           string      `json:"descriptor"`
+	MerchantOrderId      string      `json:"merchant_order_id"`
+	LatestPaymentAttempt struct {
 		Status string `json:"status"`
 	} `json:"latest_payment_attempt"`
 	Metadata map[string]interface{} `json:"metadata"`
@@ -227,7 +236,7 @@ type AirwallexIntents struct {
 }
 
 type AirWallexIntentInfo struct {
-	Amount          float64
+	Amount          json.Number
 	Currency        string
 	Id              string
 	Status          string
@@ -247,22 +256,20 @@ func (c *AirwallexClient) GetIntentByOrderId(orderId string) (*AirWallexIntentIn
 	if len(items) == 0 {
 		return nil, fmt.Errorf("no payment intent found for order id: %s", orderId)
 	}
-	intent := items[0].(map[string]interface{})
-	intentInfo := &AirWallexIntentInfo{
-		Id:              intent["id"].(string),
-		Amount:          intent["amount"].(float64),
-		Currency:        intent["currency"].(string),
-		Status:          intent["status"].(string),
-		Descriptor:      intent["descriptor"].(string),
-		MerchantOrderId: intent["merchant_order_id"].(string),
+	var intent AirwallexIntent
+	if b, err := json.Marshal(items[0]); err == nil {
+		json.Unmarshal(b, &intent)
 	}
-	if latestPaymentAttempt, ok := intent["latest_payment_attempt"].(map[string]interface{}); ok {
-		intentInfo.PaymentStatus = latestPaymentAttempt["status"].(string)
-	}
-	if metadata, ok := intent["metadata"].(map[string]interface{}); ok {
-		intentInfo.Metadata = metadata
-	}
-	return intentInfo, nil
+	return &AirWallexIntentInfo{
+		Id:              intent.Id,
+		Amount:          intent.Amount,
+		Currency:        intent.Currency,
+		Status:          intent.Status,
+		Descriptor:      intent.Descriptor,
+		MerchantOrderId: intent.MerchantOrderId,
+		PaymentStatus:   intent.LatestPaymentAttempt.Status,
+		Metadata:        intent.Metadata,
+	}, nil
 }
 
 func (c *AirwallexClient) GetCheckoutUrl(intent *AirWallexIntentResp, r *PayReq) (string, error) {
